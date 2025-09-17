@@ -50,14 +50,15 @@ Note that the main backbone of MICM is detailed in the MICM.py
 # Citation
 If you find this repo useful, please cite the following publication:
 ```
-@article{feng2023ic9600,
-  title={IC9600: A Benchmark Dataset for Automatic Image Complexity Assessment},
-  author={Feng, Tinglei and Zhai, Yingjie and Yang, Jufeng and Liang, Jie and Fan, Deng-Ping and Zhang, Jing and Shao, Ling and Tao, Dacheng},
-  journal={IEEE Transactions on Pattern Analysis and Machine Intelligence},
-  number={01},
-  pages={1--17},
-  year={2023},
-  publisher={IEEE Computer Society},
-  doi={10.1109/TPAMI.2022.3232328},
+@article{LI2025103131,
+title = {Unlocking implicit motion for evaluating image complexity},
+journal = {Displays},
+volume = {90},
+pages = {103131},
+year = {2025},
+issn = {0141-9382},
+doi = {https://doi.org/10.1016/j.displa.2025.103131},
+url = {https://www.sciencedirect.com/science/article/pii/S0141938225001684},
+author = {Yixiao Li and Xiaoyuan Yang and Yuqing Luo and Hadi Amirpour and Hantao Liu and Wei Zhou}
 }
 ```
