@@ -21,18 +21,13 @@ class TextEncoder(nn.Module):
         super().__init__()
         self.tokenizer = BertTokenizer.from_pretrained(model_name)
         self.bert = BertModel.from_pretrained(model_name)
-        #self.proj = nn.Sequential(
-        #    nn.Linear(768, 768),
-         #   nn.LayerNorm(768),
-        #    nn.ReLU()
-        #)
 
     def forward(self, text):
         inputs = self.tokenizer(
             text, return_tensors="pt", padding='max_length', truncation=True, max_length=32
         ).to(next(self.parameters()).device)
         outputs = self.bert(**inputs)
-        return outputs.last_hidden_state # [B, S, D]
+        return outputs.last_hidden_state  # [B, S, D]
 
 
 class VideoEncoder(nn.Module):
@@ -46,8 +41,6 @@ class VideoEncoder(nn.Module):
             nn.ReLU(),
             PermuteLayer(0, 2, 1),  # [B, D, T] -> [B, T, D]
             nn.LayerNorm(embed_dim),  # 在特征维度归一化
-            #PermuteLayer(0, 2, 1),  # [B, T, D] -> [B, D, T]
-            #nn.Conv1d(embed_dim, embed_dim, 3, padding=1)  # [B, D, T]
         )
 
         # 运动建模GRU
@@ -57,7 +50,6 @@ class VideoEncoder(nn.Module):
             bidirectional=True,
             batch_first=True
         )
-        #self.motion_proj = nn.Linear(embed_dim, embed_dim)
 
         # 动态时间对齐
         self.adaptive_pool = nn.AdaptiveAvgPool1d(target_frames)
@@ -71,14 +63,12 @@ class VideoEncoder(nn.Module):
         x = self.adaptive_pool(x)  # [B, 4096, target_T]
 
         # 时空特征提取
-        base_feat = self.temporal_conv(x)  # [B, D, target_T]
-        #base_feat = base_feat.permute(0, 2, 1)  # [B, target_T, D]
+        base_feat = self.temporal_conv(x)  # [B, target_T, D]
 
         # 运动特征提取
         motion_feat, _ = self.motion_gru(base_feat)  # [B, T, D]
-        #motion_feat = self.motion_proj(motion_feat)
 
-        return  motion_feat  # 残差连接 [B, T, D]
+        return motion_feat  # [B, T, D]
 
 
 class CrossModalAligner(nn.Module):
@@ -91,9 +81,6 @@ class CrossModalAligner(nn.Module):
         # 时间-语义聚合
         self.time_weight = nn.Parameter(torch.ones(1, 32, 1))  # [1, T, 1]
         self.cls_proj = nn.Linear(embed_dim, embed_dim)
-
-        # 对比参数
-        self.logit_scale = nn.Parameter(torch.tensor([1 / 0.07]).log())
 
     def forward(self, video_feat, text_feat):
         """
@@ -134,42 +121,100 @@ class HierarchicalLoss(nn.Module):
         super().__init__()
         self.temp = nn.Parameter(torch.tensor([1.0]).log())
 
-    def forward(self, video_global, text_global, video_local, text_local):
-        # 全局对比损失
-        logit_scale = self.temp.exp()
-        global_sim = logit_scale * video_global @ text_global.t()
-        loss_global = (F.cross_entropy(global_sim, torch.arange(len(video_global), device=video_global.device)) +
-                       F.cross_entropy(global_sim.t(), torch.arange(len(text_global), device=text_global.device))) / 2
-
-        # 局部时序对齐损失
+    def compute_local_similarity(self, video_local, text_local, logit_scale):
+        """计算局部相似度矩阵"""
         batch_size, T, D = video_local.shape
         S = text_local.size(1)
-
-        # 帧-token相似度矩阵
-        local_sim = torch.einsum('btd,bsd->bts', video_local, text_local)  # [B, T, S]
+        
+        # 计算帧-token相似度矩阵 [B, T, S]
+        local_sim = torch.einsum('btd,bsd->bts', video_local, text_local)
         local_sim = logit_scale * local_sim
+        
+        return local_sim
 
-        # 时间敏感权重
-        time_weights = F.softmax(local_sim.max(dim=-1).values, dim=-1)  # [B, T]
+    def compute_positive_scores(self, local_sim):
+        """计算正样本分数 - 与正文公式一致"""
+        batch_size, T, S = local_sim.shape
+        
+        # 时间敏感权重计算 [B, T]
+        time_weights = F.softmax(local_sim.max(dim=-1).values, dim=-1)
+        
+        # 正样本分数计算: 每帧与所有token的平均相似度 [B, T]
+        frame_text_similarity = local_sim.mean(dim=-1)  # [B, T]
+        
+        # 加权聚合 [B]
+        pos_scores = (frame_text_similarity * time_weights).sum(dim=1)
+        
+        return pos_scores, time_weights
 
-        # 正样本强化
-        pos_scores = torch.diagonal(
-            local_sim.permute(1, 0, 2),  # [T, B, S]
-            dim1=1, dim2=2
-        ).permute(1, 0)  # [B, T]
+    def compute_negative_scores(self, local_sim_pairs, time_weights):
+        """计算负样本分数 - 与正文公式一致"""
+        batch_size = local_sim_pairs.shape[0]
+        
+        # 计算所有负样本对的相似度矩阵
+        neg_scores = []
+        for i in range(batch_size):
+            sample_neg_scores = []
+            for j in range(batch_size):
+                if i == j:
+                    continue  # 跳过正样本对
+                
+                # 计算样本i与样本j的局部相似度矩阵 [T, S]
+                local_sim_ij = local_sim_pairs[i, j]  # 假设已经预计算好
+                
+                # 使用样本i的时间权重加权平均 [T] -> scalar
+                neg_score_ij = (time_weights[i] * local_sim_ij.mean(dim=-1)).sum()
+                sample_neg_scores.append(neg_score_ij)
+            
+            neg_scores.append(torch.stack(sample_neg_scores))
+        
+        neg_scores = torch.stack(neg_scores)  # [B, B-1]
+        return neg_scores
 
-        # 应用时间权重
-        pos_scores = (pos_scores * time_weights).sum(dim=1)  # [B]
+    def forward(self, video_global, text_global, video_local, text_local):
+        logit_scale = self.temp.exp()
+        
+        # 全局对比损失
+        global_sim = logit_scale * (video_global @ text_global.t())
+        loss_global = (F.cross_entropy(global_sim, torch.arange(len(video_global), device=video_global.device)) +
+                      F.cross_entropy(global_sim.t(), torch.arange(len(text_global), device=text_global.device))) / 2
 
-        # 负样本挖掘
-        neg_mask = ~torch.eye(batch_size, dtype=torch.bool, device=video_global.device)
-        neg_scores = local_sim.mean(dim=(1, 2)).expand(batch_size, batch_size)[neg_mask].view(batch_size, -1)
-
+        # 局部对比损失
+        batch_size = video_local.size(0)
+        
+        # 计算正样本对的局部相似度
+        local_sim_positive = self.compute_local_similarity(video_local, text_local, logit_scale)
+        
+        # 计算正样本分数
+        pos_scores, time_weights = self.compute_positive_scores(local_sim_positive)
+        
+        # 计算负样本分数 (简化实现 - 在实际应用中需要预计算所有样本对的相似度)
+        # 这里使用当前批次内其他样本作为负样本
+        neg_scores = []
+        for i in range(batch_size):
+            sample_neg_scores = []
+            for j in range(batch_size):
+                if i == j:
+                    continue
+                # 使用样本i的视频特征和样本j的文本特征计算负样本相似度
+                local_sim_neg = self.compute_local_similarity(
+                    video_local[i:i+1], text_local[j:j+1], logit_scale
+                ).squeeze(0)  # [T, S]
+                
+                # 加权平均计算负样本分数
+                neg_score = (time_weights[i] * local_sim_neg.mean(dim=-1)).sum()
+                sample_neg_scores.append(neg_score)
+            
+            neg_scores.append(torch.stack(sample_neg_scores))
+        
+        neg_scores = torch.stack(neg_scores)  # [B, B-1]
+        
         # 组合损失
         logits = torch.cat([pos_scores.unsqueeze(-1), neg_scores], dim=-1)  # [B, 1 + (B-1)]
         loss_local = F.cross_entropy(logits, torch.zeros(batch_size, dtype=torch.long, device=video_global.device))
 
         return 0.6 * loss_global + 0.4 * loss_local
+
 
 class VideoTextModel(nn.Module):
     def __init__(self, embed_dim=768):
@@ -181,18 +226,18 @@ class VideoTextModel(nn.Module):
 
         self.aligner = CrossModalAligner(embed_dim)
         self.loss_fn = HierarchicalLoss()
-        self.head1 = nn.Sequential(nn.Linear(embed_dim, 256), nn.Dropout(0.5), nn.ReLU(), nn.Linear(256, 1),
-                                   nn.Sigmoid())
-        self.head2 = nn.Sequential(nn.Linear(embed_dim, 256), nn.Dropout(0.5), nn.ReLU(), nn.Linear(256, 1),
-                                   nn.Sigmoid())
-
-        # 多模态融合
-        self.fusion = nn.Sequential(
-            nn.Linear(2 * embed_dim, 512),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(512, 1),
+        self.head1 = nn.Sequential(
+            nn.Linear(embed_dim, 256), 
+            nn.Dropout(0.5), 
+            nn.ReLU(), 
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+        self.head2 = nn.Sequential(
+            nn.Linear(embed_dim, 256), 
+            nn.Dropout(0.5), 
+            nn.ReLU(), 
+            nn.Linear(256, 1),
             nn.Sigmoid()
         )
 
@@ -210,10 +255,9 @@ class VideoTextModel(nn.Module):
 
         # 特征融合
         score1 = self.head1(img_feat).squeeze()
-
         score2 = self.head2(v_global).squeeze()
 
-        return score1,score2, align_loss
+        return score1, score2, align_loss
 
 
 # 示例用法
@@ -228,6 +272,7 @@ if __name__ == "__main__":
                    "cars moving fast", "water flowing"]
 
     # 前向传播测试
-    scores, loss = model(dummy_images, dummy_videos, dummy_texts)
-    print(f"Scores shape: {scores.shape}")  # 应输出 torch.Size([4])
+    score1, score2, loss = model(dummy_images, dummy_videos, dummy_texts)
+    print(f"Score1 shape: {score1.shape}")  # 应输出 torch.Size([4])
+    print(f"Score2 shape: {score2.shape}")  # 应输出 torch.Size([4])
     print(f"Loss value: {loss.item():.4f}")  # 合理损失值
