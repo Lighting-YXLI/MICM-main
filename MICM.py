@@ -133,10 +133,10 @@ class HierarchicalLoss(nn.Module):
         return local_sim
 
     def compute_positive_scores(self, local_sim):
-        """计算正样本分数 - 与正文公式一致"""
+        """计算正样本分数 - 使用时间权重加权"""
         batch_size, T, S = local_sim.shape
         
-        # 时间敏感权重计算 [B, T]
+        # 时间敏感权重计算 [B, T] - 基于正样本对的相似度
         time_weights = F.softmax(local_sim.max(dim=-1).values, dim=-1)
         
         # 正样本分数计算: 每帧与所有token的平均相似度 [B, T]
@@ -145,13 +145,12 @@ class HierarchicalLoss(nn.Module):
         # 加权聚合 [B]
         pos_scores = (frame_text_similarity * time_weights).sum(dim=1)
         
-        return pos_scores, time_weights
+        return pos_scores
 
-    def compute_negative_scores(self, local_sim_pairs, time_weights):
-        """计算负样本分数 - 与正文公式一致"""
-        batch_size = local_sim_pairs.shape[0]
+    def compute_negative_scores(self, video_local, text_local, logit_scale):
+        """计算负样本分数 - 直接计算平均相似度，不使用时间权重"""
+        batch_size = video_local.size(0)
         
-        # 计算所有负样本对的相似度矩阵
         neg_scores = []
         for i in range(batch_size):
             sample_neg_scores = []
@@ -159,12 +158,14 @@ class HierarchicalLoss(nn.Module):
                 if i == j:
                     continue  # 跳过正样本对
                 
-                # 计算样本i与样本j的局部相似度矩阵 [T, S]
-                local_sim_ij = local_sim_pairs[i, j]  # 假设已经预计算好
+                # 使用样本i的视频特征和样本j的文本特征计算负样本相似度
+                local_sim_neg = self.compute_local_similarity(
+                    video_local[i:i+1], text_local[j:j+1], logit_scale
+                )  # [1, T, S]
                 
-                # 使用样本i的时间权重加权平均 [T] -> scalar
-                neg_score_ij = (time_weights[i] * local_sim_ij.mean(dim=-1)).sum()
-                sample_neg_scores.append(neg_score_ij)
+                # 直接计算平均相似度，不使用时间权重
+                neg_score = local_sim_neg.mean()  # scalar
+                sample_neg_scores.append(neg_score)
             
             neg_scores.append(torch.stack(sample_neg_scores))
         
@@ -185,29 +186,11 @@ class HierarchicalLoss(nn.Module):
         # 计算正样本对的局部相似度
         local_sim_positive = self.compute_local_similarity(video_local, text_local, logit_scale)
         
-        # 计算正样本分数
-        pos_scores, time_weights = self.compute_positive_scores(local_sim_positive)
+        # 计算正样本分数（使用时间权重）
+        pos_scores = self.compute_positive_scores(local_sim_positive)
         
-        # 计算负样本分数 (简化实现 - 在实际应用中需要预计算所有样本对的相似度)
-        # 这里使用当前批次内其他样本作为负样本
-        neg_scores = []
-        for i in range(batch_size):
-            sample_neg_scores = []
-            for j in range(batch_size):
-                if i == j:
-                    continue
-                # 使用样本i的视频特征和样本j的文本特征计算负样本相似度
-                local_sim_neg = self.compute_local_similarity(
-                    video_local[i:i+1], text_local[j:j+1], logit_scale
-                ).squeeze(0)  # [T, S]
-                
-                # 加权平均计算负样本分数
-                neg_score = (time_weights[i] * local_sim_neg.mean(dim=-1)).sum()
-                sample_neg_scores.append(neg_score)
-            
-            neg_scores.append(torch.stack(sample_neg_scores))
-        
-        neg_scores = torch.stack(neg_scores)  # [B, B-1]
+        # 计算负样本分数（不使用时间权重）
+        neg_scores = self.compute_negative_scores(video_local, text_local, logit_scale)
         
         # 组合损失
         logits = torch.cat([pos_scores.unsqueeze(-1), neg_scores], dim=-1)  # [B, 1 + (B-1)]
@@ -276,3 +259,4 @@ if __name__ == "__main__":
     print(f"Score1 shape: {score1.shape}")  # 应输出 torch.Size([4])
     print(f"Score2 shape: {score2.shape}")  # 应输出 torch.Size([4])
     print(f"Loss value: {loss.item():.4f}")  # 合理损失值
+
